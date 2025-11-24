@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import inspect
 from decimal import Decimal
-from typing import TYPE_CHECKING, Callable, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from pydantic import ConfigDict, Field, field_validator
 
@@ -11,6 +11,8 @@ from hummingbot.core.data_type.common import MarketDict
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
+from hummingbot.strategy_v2.controllers.metaapi_data_config import MetaAPIDataConfig
+from hummingbot.strategy_v2.controllers.hooks.metaapi_data_hook import MetaAPIDataHook
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import ExecutorAction
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
@@ -54,6 +56,15 @@ class ControllerConfigBase(BaseClientModel):
             "prompt_on_new": False,
             "is_updatable": False
         })
+    metaapi_data: MetaAPIDataConfig = Field(
+        default=MetaAPIDataConfig(),
+        description="Optional MetaAPI integration (set enabled=true to pull stats/candles automatically).",
+        json_schema_extra={
+            "prompt": "Configure MetaAPI data hook? Enter as enabled,symbol1|symbol2,timeframe (leave blank for default)",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @field_validator('id', mode="before")
@@ -142,6 +153,10 @@ class ControllerBase(RunnableBase):
         self.processed_data = {}
         self.executors_update_event = asyncio.Event()
         self.executors_info_queue = asyncio.Queue()
+        self.metaapi_data_hook = MetaAPIDataHook(config.metaapi_data) if config.metaapi_data.enabled else None
+        self.metaapi_data_snapshot: Dict[str, Any] = {}
+        self._metaapi_wait_logged = False
+        self._metaapi_shutdown_task: Optional[asyncio.Task] = None
 
     def start(self):
         """
@@ -158,6 +173,14 @@ class ControllerBase(RunnableBase):
         for candles_config in self.config.candles_config:
             self.market_data_provider.initialize_candles_feed(candles_config)
 
+    def stop(self):
+        super().stop()
+        self._schedule_metaapi_shutdown()
+
+    def on_stop(self):
+        super().on_stop()
+        self._schedule_metaapi_shutdown()
+
     def update_config(self, new_config: ControllerConfigBase):
         """
         Update the controller configuration. With the variables that in the client_data have the is_updatable flag set
@@ -170,6 +193,19 @@ class ControllerBase(RunnableBase):
 
     async def control_task(self):
         if self.market_data_provider.ready and self.executors_update_event.is_set():
+            if self.metaapi_data_hook and not self.metaapi_data_hook.ready_for_trading:
+                if not self._metaapi_wait_logged:
+                    warmup = self.config.metaapi_data.streaming_warmup_minutes if self.config.metaapi_data else 0
+                    self.logger().info(
+                        "Waiting for MetaAPI history/streaming warmup before trading (warmup=%s min).", warmup
+                    )
+                    self._metaapi_wait_logged = True
+                await self._maybe_refresh_metaapi_data()
+                return
+            if self._metaapi_wait_logged:
+                self.logger().info("MetaAPI warmup complete. Trading enabled.")
+                self._metaapi_wait_logged = False
+            await self._maybe_refresh_metaapi_data()
             await self.update_processed_data()
             executor_actions: List[ExecutorAction] = self.determine_executor_actions()
             if len(executor_actions) > 0:
@@ -200,9 +236,26 @@ class ControllerBase(RunnableBase):
         """
         raise NotImplementedError
 
+    async def _maybe_refresh_metaapi_data(self):
+        if not self.metaapi_data_hook:
+            return
+        try:
+            default_symbol = getattr(self.config, "trading_pair", None)
+            self.metaapi_data_snapshot = await self.metaapi_data_hook.fetch_snapshot(default_symbol=default_symbol)
+        except Exception:
+            self.logger().warning("Failed to refresh MetaAPI data snapshot.", exc_info=True)
+
     def to_format_status(self) -> List[str]:
         """
         This method should be overridden by the derived classes to implement the logic to format the status of the
         controller to be displayed in the UI.
         """
         return []
+
+    def _schedule_metaapi_shutdown(self):
+        if (
+            self.metaapi_data_hook is None
+            or (self._metaapi_shutdown_task is not None and not self._metaapi_shutdown_task.done())
+        ):
+            return
+        self._metaapi_shutdown_task = safe_ensure_future(self.metaapi_data_hook.stop())
